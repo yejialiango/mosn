@@ -34,9 +34,8 @@ type sessionChecker struct {
 	Host          types.Host
 	HealthChecker *healthChecker
 	//
-	resp          chan checkResponse
-	timeout       chan bool
 	checkID       uint64
+	currentID     uint64
 	stop          chan struct{}
 	checkTimer    *utils.Timer
 	checkTimeout  *utils.Timer
@@ -44,18 +43,11 @@ type sessionChecker struct {
 	healthCount   uint32
 }
 
-type checkResponse struct {
-	ID      uint64
-	Healthy bool
-}
-
 func newChecker(s types.HealthCheckSession, h types.Host, hc *healthChecker) *sessionChecker {
 	c := &sessionChecker{
 		Session:       s,
 		Host:          h,
 		HealthChecker: hc,
-		resp:          make(chan checkResponse),
-		timeout:       make(chan bool),
 		stop:          make(chan struct{}),
 	}
 	return c
@@ -79,37 +71,17 @@ func (c *sessionChecker) Start() {
 			return
 		default:
 			// prepare a check
-			currentID := atomic.AddUint64(&c.checkID, 1)
+			c.currentID = atomic.AddUint64(&c.checkID, 1)
 			select {
 			case <-c.stop:
 				return
-			case resp := <-c.resp:
-				// if the ID is not equal, means we receive a timeout for this ID, ignore the response
-				if resp.ID == currentID {
-					c.checkTimeout.Stop()
-					if resp.Healthy {
-						c.HandleSuccess()
-					} else {
-						c.HandleFailure(types.FailureActive)
-					}
-					// next health checker
-					c.checkTimer = utils.NewTimer(c.HealthChecker.getCheckInterval(), c.OnCheck)
-					if log.DefaultLogger.GetLogLevel() >= log.DEBUG {
-						log.DefaultLogger.Debugf("[upstream] [health check] [session checker] receive a response id: %d", resp.ID)
-					}
-				} else {
-					if log.DefaultLogger.GetLogLevel() >= log.DEBUG {
-						log.DefaultLogger.Debugf("[upstream] [health check] [session checker] receive a expired id response, response id: %d, currentID: %d", resp.ID, currentID)
-					}
-				}
-			case <-c.timeout:
-				c.checkTimer.Stop()
-				c.Session.OnTimeout() // session timeout callbacks
-				c.HandleFailure(types.FailureNetwork)
+			case <-time.After(c.HealthChecker.getCheckInterval()):
+				c.checkTimeout.Stop()
 				// next health checker
 				c.checkTimer = utils.NewTimer(c.HealthChecker.getCheckInterval(), c.OnCheck)
+				c.checkTimer = utils.NewTimer(c.HealthChecker.initialDelay, c.OnCheck)
 				if log.DefaultLogger.GetLogLevel() >= log.DEBUG {
-					log.DefaultLogger.Debugf("[upstream] [health check] [session checker] receive a timeout response at id: %d", currentID)
+					log.DefaultLogger.Debugf("[upstream] [health check] [session checker] start next session check timer, address: %s", c.Host.AddressString())
 				}
 			}
 		}
@@ -157,12 +129,29 @@ func (c *sessionChecker) OnCheck() {
 	// start a timeout before check health
 	c.checkTimeout.Stop()
 	c.checkTimeout = utils.NewTimer(c.HealthChecker.timeout, c.OnTimeout)
-	c.resp <- checkResponse{
-		ID:      id,
-		Healthy: c.Session.CheckHealth(),
+	Healthy := c.Session.CheckHealth()
+
+	// if the ID is not equal, means we receive a timeout for this ID, ignore the response
+	if id == c.currentID {
+		c.checkTimeout.Stop()
+		if Healthy {
+			c.HandleSuccess()
+		} else {
+			c.HandleFailure(types.FailureActive)
+		}
+		// next health checker
+		if log.DefaultLogger.GetLogLevel() >= log.DEBUG {
+			log.DefaultLogger.Debugf("[upstream] [health check] [session checker] receive a response id: %d", id)
+		}
+	} else {
+		if log.DefaultLogger.GetLogLevel() >= log.DEBUG {
+			log.DefaultLogger.Debugf("[upstream] [health check] [session checker] receive a expired id response, response id: %d, currentID: %d", id, c.currentID)
+		}
 	}
 }
 
 func (c *sessionChecker) OnTimeout() {
-	c.timeout <- true
+	c.checkTimer.Stop()
+	c.Session.OnTimeout() // session timeout callbacks
+	c.HandleFailure(types.FailureNetwork)
 }

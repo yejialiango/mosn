@@ -18,7 +18,10 @@
 package healthcheck
 
 import (
+	"encoding/json"
+	"mosn.io/api"
 	"net"
+	"reflect"
 	"time"
 
 	"mosn.io/mosn/pkg/log"
@@ -27,19 +30,52 @@ import (
 
 type TCPDialSessionFactory struct{}
 
+const (
+	TCPCheckConfigKey = "tcp_check_config"
+)
+
+var tcpDefaultTimeout = api.DurationConfig{time.Second * 5}
+
+type TCPCheckConfig struct {
+	Timeout api.DurationConfig `json:"timeout,omitempty"`
+}
+
 func (f *TCPDialSessionFactory) NewSession(cfg map[string]interface{}, host types.Host) types.HealthCheckSession {
-	return &TCPDialSession{
-		addr: host.AddressString(),
+	tcpDialSession := &TCPDialSession{
+		addr:    host.AddressString(),
+		timeout: tcpDefaultTimeout.Duration,
 	}
+	v, ok := cfg[TCPCheckConfigKey]
+	if !ok {
+		return tcpDialSession
+	}
+	tcpCfg, ok := v.(*TCPCheckConfig)
+	if !ok {
+		tcpCfgBytes, err := json.Marshal(v)
+		if err != nil {
+			log.DefaultLogger.Errorf("[upstream] [health check] [tcpdial session] tcpCfg covert %+v error %+v %+v", reflect.TypeOf(v), v, err)
+			return nil
+		}
+		tcpCfg = &TCPCheckConfig{}
+		if err := json.Unmarshal(tcpCfgBytes, tcpCfg); err != nil {
+			log.DefaultLogger.Errorf("[upstream] [health check] [tcpdial session] tcpCfg Unmarshal %+v error %+v %+v", reflect.TypeOf(v), v, err)
+			return nil
+		}
+	}
+	if tcpCfg.Timeout.Duration > 0 {
+		tcpDialSession.timeout = tcpCfg.Timeout.Duration
+	}
+	return tcpDialSession
 }
 
 type TCPDialSession struct {
-	addr string
+	addr    string
+	timeout time.Duration
 }
 
 func (s *TCPDialSession) CheckHealth() bool {
 	// default dial timeout, maybe already timeout by checker
-	conn, err := net.DialTimeout("tcp", s.addr, 30*time.Second)
+	conn, err := net.DialTimeout("tcp", s.addr, s.timeout)
 	if err != nil {
 		if log.DefaultLogger.GetLogLevel() >= log.INFO {
 			log.DefaultLogger.Infof("[upstream] [health check] [tcpdial session] dial tcp for host %s error: %v", s.addr, err)
