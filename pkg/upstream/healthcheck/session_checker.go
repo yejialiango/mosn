@@ -78,7 +78,6 @@ func (c *sessionChecker) Start() {
 			case <-time.After(c.HealthChecker.getCheckInterval()):
 				c.checkTimeout.Stop()
 				// next health checker
-				c.checkTimer = utils.NewTimer(c.HealthChecker.getCheckInterval(), c.OnCheck)
 				c.checkTimer = utils.NewTimer(c.HealthChecker.initialDelay, c.OnCheck)
 				if log.DefaultLogger.GetLogLevel() >= log.DEBUG {
 					log.DefaultLogger.Debugf("[upstream] [health check] [session checker] start next session check timer, address: %s", c.Host.AddressString())
