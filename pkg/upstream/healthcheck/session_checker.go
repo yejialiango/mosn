@@ -148,6 +148,7 @@ func (c *sessionChecker) OnCheck() {
 }
 
 func (c *sessionChecker) OnTimeout() {
+	atomic.AddUint64(&c.checkID, 1)
 	c.checkTimer.Stop()
 	c.Session.OnTimeout() // session timeout callbacks
 	c.HandleFailure(types.FailureNetwork)
