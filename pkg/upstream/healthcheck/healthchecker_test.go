@@ -145,8 +145,8 @@ func TestHealthCheck(t *testing.T) {
 				if changed != 1 {
 					return fmt.Errorf("timeout changed not expected %d", changed)
 				}
-				if !(hc.stats.attempt.Count() >= 1 &&
-					hc.stats.attempt.Count() <= 2 &&
+				if !(hc.stats.attempt.Count() >= 2 &&
+					hc.stats.attempt.Count() <= 4 &&
 					hc.stats.success.Count() == 0 &&
 					hc.stats.failure.Count() <= 2 &&
 					hc.stats.networkFailure.Count() <= 2 &&

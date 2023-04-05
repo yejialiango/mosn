@@ -76,7 +76,6 @@ func (c *sessionChecker) Start() {
 			case <-c.stop:
 				return
 			case <-time.After(c.HealthChecker.getCheckInterval()):
-				c.checkTimeout.Stop()
 				// next health checker
 				c.checkTimer = utils.NewTimer(c.HealthChecker.initialDelay, c.OnCheck)
 				if log.DefaultLogger.GetLogLevel() >= log.DEBUG {
@@ -126,7 +125,6 @@ func (c *sessionChecker) OnCheck() {
 	id := atomic.LoadUint64(&c.checkID)
 	c.HealthChecker.stats.attempt.Inc(1)
 	// start a timeout before check health
-	c.checkTimeout.Stop()
 	c.checkTimeout = utils.NewTimer(c.HealthChecker.timeout, c.OnTimeout)
 	Healthy := c.Session.CheckHealth()
 
