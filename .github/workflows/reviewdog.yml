@@ -2,7 +2,7 @@ name: actions
 on:
   push:
     branches:
-      - master
+      - bugfix*
   pull_request:
     types:
       - opened
