@@ -2,7 +2,7 @@ name: actions
 on:
   push:
     branches:
-      - bugfix*
+      - bugfix/sessionchecker_goroutine_leakage
   pull_request:
     types:
       - opened
