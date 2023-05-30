@@ -55,6 +55,7 @@ func init() {
 
 const defaultMaxRequestBodySize = 4 * 1024 * 1024
 const defaultMaxHeaderSize = 8 * 1024
+const defaultPerStreamBodySize = 1 << 20
 
 var (
 	errConnClose = errors.New("connection closed")
@@ -311,59 +312,30 @@ func (conn *clientStreamConnection) serve() {
 		}
 		if conn.useStream || httpRspUseStream {
 			_ = variable.Set(s.ctx, types.VarHttpResponseUseStream, true)
-			// handle stream response
-			if dsConnection, varErr := variable.Get(s.ctx, types.VariableConnection); varErr == nil {
-				if dsConn, ok := dsConnection.(api.Connection); ok {
-					log.Proxy.Debugf(s.ctx, "[upstream] [stream response] [http] client stream receive header: %s", s.response.Header.Header())
-					if s.request.Header.ConnectionClose() {
-						if !s.response.Header.ConnectionClose() {
-							s.response.Header.Del("Connection")
-							s.response.SetConnectionClose()
-						}
-					} else if !s.request.Header.IsHTTP11() {
-						s.response.Header.SetCanonical(HKConnection, HVKeepAlive)
-					}
-					// Write header first
-					err = dsConn.Write(buffer.NewIoBufferBytes(s.response.Header.Header()))
-					if err != nil {
-						log.Proxy.Errorf(s.ctx, "[upstream] [stream response] [http] client stream write header error: %s", err)
-						reason := conn.resetReason
-						if reason == "" {
-							reason = types.StreamRemoteReset
-						}
-						s.ResetStream(reason)
-						return
-					}
-					statusCode := s.response.Header.StatusCode()
-					status := strconv.Itoa(statusCode)
-					_ = variable.SetString(s.ctx, types.VarHeaderStatus, status)
-					reader := conn.br
-					if err = writeBody(reader, 0, s.response.Header.ContentLength(), func(data []byte) error {
-						log.Proxy.Debugf(s.ctx, "[upstream] [stream response] [http] client stream receive body: %s, local address: %s, remote address: %s, connectionId: %d",
-							string(data), dsConn.LocalAddr().String(), dsConn.RemoteAddr().String(), dsConn.ID())
-						if err = dsConn.Write(buffer.NewIoBufferBytes(data)); err != nil {
-							return err
-						}
-						resetDownstreamTimer(s.ctx, buffers.serverStream.receiver)
-						receivedBytes := uint64(len(data))
-						if v, vErr := variable.Get(s.ctx, types.VarStreamResponseBytes); vErr == nil {
-							if b, ok := v.(uint64); ok {
-								receivedBytes = b + receivedBytes
-							}
-						}
-						_ = variable.Set(s.ctx, types.VarStreamResponseBytes, receivedBytes)
-						return nil
-					}); err != nil {
-						log.Proxy.Debugf(s.ctx, "[upstream] [stream response] [http] client stream write body error: %s", err)
-						reason := conn.resetReason
-						if reason == "" {
-							reason = types.StreamLocalReset
-						}
-						s.ResetStream(reason)
-					}
+			s.connection.mutex.Lock()
+			s.connection.stream = nil
+			s.connection.mutex.Unlock()
+			cs := &buffers.clientStream
+			cs.recData = buffer.NewPipeBuffer(0)
+			header := mosnhttp.ResponseHeader{&s.response.Header}
+			cs.receiver.OnReceive(cs.ctx, header, cs.recData, nil)
+			if err = writeBodyToPipe(conn.br, 0, s.response.Header.ContentLength(), func(data []byte) error {
+				if _, err = cs.recData.Write(data); err != nil {
+					return err
 				}
+				return nil
+			}); err != nil {
+				log.Proxy.Errorf(s.connection.context, "[stream] [http] [stream response] client stream write buffer: %s", err)
+				reason := conn.resetReason
+				if reason == "" {
+					reason = types.StreamRemoteReset
+				}
+				s.ResetStream(reason)
+				return
 			}
-
+			cs.recData.CloseWithError(io.EOF)
+			// destroy stream
+			cs.stream.DestroyStream()
 		} else {
 			_ = variable.Set(s.ctx, types.VarHttpResponseUseStream, false)
 			// 1. blocking read using fasthttp.Response.Read
@@ -379,31 +351,30 @@ func (conn *clientStreamConnection) serve() {
 				}
 				return
 			}
-		}
-		if log.Proxy.GetLogLevel() >= log.DEBUG {
-			log.Proxy.Debugf(s.stream.ctx, "[stream] [http] receive response, requestId = %v", s.stream.id)
-		}
+			if log.Proxy.GetLogLevel() >= log.DEBUG {
+				log.Proxy.Debugf(s.stream.ctx, "[stream] [http] receive response, requestId = %v", s.stream.id)
+			}
 
+			if atomic.LoadInt32(&s.readDisableCount) <= 0 {
+				s.handleResponse()
+			}
+		}
 		// 2. response processing
 		resetConn := false
 		if s.response.ConnectionClose() {
 			resetConn = true
 		}
-
 		// 3. local reset if header 'Connection: close' exists
 		if resetConn {
 			// goaway the connpool
 			s.connection.streamConnectionEventListener.OnGoAway()
 		}
 
-		if atomic.LoadInt32(&s.readDisableCount) <= 0 {
-			s.handleResponse()
-		}
 	}
 }
 
 // copy from fasthttp github.com/valyala/fasthttp@v1.40.0/http.go:1374
-func writeBody(r *bufio.Reader, maxBodySize int, contentLength int, writeFunc func([]byte) error) (err error) {
+func writeBodyToPipe(r *bufio.Reader, maxBodySize int, contentLength int, writeFunc func([]byte) error) (err error) {
 	buf := make([]byte, 0, 0)
 	if contentLength >= 0 {
 		err = writeFixedBody(r, contentLength, maxBodySize, buf, writeFunc)
@@ -969,6 +940,7 @@ type stream struct {
 	// NOTICE: fasthttp ctx and its member not allowed holding by others after request handle finished
 	request  *fasthttp.Request
 	response *fasthttp.Response
+	recData  types.IoBuffer
 
 	receiver types.StreamReceiveListener
 }
@@ -1070,23 +1042,6 @@ func (s *clientStream) doSend() (err error) {
 }
 
 func (s *clientStream) handleResponse() {
-	if sr, err := variable.Get(s.ctx, types.VarHttpResponseUseStream); err == nil {
-		if streamResponse, ok := sr.(bool); ok && streamResponse {
-			s.connection.mutex.Lock()
-			s.connection.stream = nil
-			s.connection.mutex.Unlock()
-			if s.receiver != nil {
-				hdr := mosnhttp.ResponseHeader{&fasthttp.ResponseHeader{}}
-				if s.response != nil {
-					hdr = mosnhttp.ResponseHeader{&s.response.Header}
-				}
-				s.receiver.OnReceive(s.ctx, hdr, nil, nil)
-				return
-			}
-		}
-
-	}
-
 	if s.response != nil {
 		header := mosnhttp.ResponseHeader{&s.response.Header}
 
@@ -1169,8 +1124,17 @@ func (s *serverStream) AppendHeaders(context context.Context, headersIn types.He
 }
 
 func (s *serverStream) AppendData(context context.Context, data buffer.IoBuffer, endStream bool) error {
+	s.recData = data
+	var httpStreamResponse bool
+	if sr, err := variable.Get(context, types.VarHttpResponseUseStream); err == nil {
+		if isStreamResponse, ok := sr.(bool); ok {
+			httpStreamResponse = isStreamResponse
+		}
+	}
 	// SetBodyRaw sets response body and could avoid copying it
-	s.response.SetBodyRaw(data.Bytes())
+	if !httpStreamResponse {
+		s.response.SetBodyRaw(data.Bytes())
+	}
 
 	if endStream {
 		s.endStream()
@@ -1212,6 +1176,23 @@ func (s *serverStream) endStream() {
 	if sr, err := variable.Get(s.ctx, types.VarHttpResponseUseStream); err == nil {
 		if streamResponse, ok := sr.(bool); ok && !streamResponse {
 			s.doSend()
+		} else {
+			// stream response write header first
+			if _, err = s.response.Header.WriteTo(s.connection); err != nil {
+				log.Proxy.Errorf(s.stream.ctx, "[stream] [http] [stream response] send server response header error: %+v", err)
+			} else {
+				if log.Proxy.GetLogLevel() >= log.DEBUG {
+					log.Proxy.Debugf(s.stream.ctx, "[stream] [http] [stream response] send server response header, requestId = %v", s.stream.id)
+				}
+			}
+			// write data
+			if err = s.writeData(); err != nil {
+				log.Proxy.Errorf(s.stream.ctx, "[stream] [http] [stream response] send server response data error: %+v", err)
+			} else {
+				if log.Proxy.GetLogLevel() >= log.DEBUG {
+					log.Proxy.Debugf(s.stream.ctx, "[stream] [http] [stream response] send server response data, requestId = %v", s.stream.id)
+				}
+			}
 		}
 	}
 
@@ -1226,6 +1207,29 @@ func (s *serverStream) endStream() {
 	s.connection.mutex.Lock()
 	s.connection.stream = nil
 	s.connection.mutex.Unlock()
+}
+
+func (s *serverStream) writeData() error {
+	var sawEOF bool
+	var receivedBytes uint64
+	bufp := buffer.GetBytes(defaultPerStreamBodySize)
+	defer buffer.PutBytes(bufp)
+	buf := *bufp
+	for !sawEOF {
+		n, err := s.recData.Read(buf)
+		if err == io.EOF {
+			sawEOF = true
+			err = nil
+		} else if err != nil {
+			return err
+		}
+		data := buf[:n]
+		log.Proxy.Debugf(s.ctx, "[stream] [http] [stream response] receive data: %s", string(data))
+		err = s.connection.conn.Write(buffer.NewIoBufferBytes(data))
+		receivedBytes = receivedBytes + uint64(len(data))
+		_ = variable.Set(s.ctx, types.VarStreamResponseBytes, receivedBytes)
+	}
+	return nil
 }
 
 func (s *serverStream) ReadDisable(disable bool) {

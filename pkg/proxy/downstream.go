@@ -625,14 +625,8 @@ func (s *downStream) receive(ctx context.Context, id uint32, phase types.Phase) 
 
 		// upstream receive header
 		case types.UpRecvHeader:
-			var httpStreamResponse bool
-			if sr, err := variable.Get(s.context, types.VarHttpResponseUseStream); err == nil {
-				if isStreamResponse, ok := sr.(bool); ok {
-					httpStreamResponse = isStreamResponse
-				}
-			}
 			// send downstream response
-			if s.downstreamRespHeaders != nil || httpStreamResponse {
+			if s.downstreamRespHeaders != nil {
 				s.printPhaseInfo(phase, id)
 				if v, vErr := variable.Get(s.context, types.VarStreamResponseBytes); vErr == nil {
 					if b, ok := v.(uint64); ok {
@@ -641,7 +635,7 @@ func (s *downStream) receive(ctx context.Context, id uint32, phase types.Phase) 
 				}
 
 				_ = variable.Set(s.context, types.VariableDownStreamRespHeaders, s.downstreamRespHeaders)
-				s.upstreamRequest.receiveHeaders((s.downstreamRespDataBuf == nil && s.downstreamRespTrailers == nil) || httpStreamResponse)
+				s.upstreamRequest.receiveHeaders(s.downstreamRespDataBuf == nil && s.downstreamRespTrailers == nil)
 
 				if p, err := s.processError(id); err != nil {
 					return p
@@ -1127,7 +1121,11 @@ func (s *downStream) appendData(endStream bool) {
 	data := s.downstreamRespDataBuf
 	s.requestInfo.SetBytesSent(s.requestInfo.BytesSent() + uint64(data.Len()))
 	s.responseSender.AppendData(s.context, data, endStream)
-
+	if v, vErr := variable.Get(s.context, types.VarStreamResponseBytes); vErr == nil {
+		if b, ok := v.(uint64); ok {
+			s.requestInfo.SetBytesSent(b)
+		}
+	}
 	if endStream {
 		s.endStream()
 	}

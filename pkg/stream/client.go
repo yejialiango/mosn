@@ -19,6 +19,7 @@ package stream
 
 import (
 	"context"
+	"mosn.io/pkg/variable"
 
 	metrics "github.com/rcrowley/go-metrics"
 	"mosn.io/api"
@@ -175,7 +176,15 @@ type clientStreamReceiverWrapper struct {
 }
 
 func (w *clientStreamReceiverWrapper) OnReceive(ctx context.Context, headers types.HeaderMap, data types.IoBuffer, trailers types.HeaderMap) {
-	w.stream.DestroyStream()
+	var httpRspUseStream bool
+	if useStream, err := variable.Get(ctx, types.VarHttpResponseUseStream); err == nil {
+		if httpUseStream, ok := useStream.(bool); ok {
+			httpRspUseStream = httpUseStream
+		}
+	}
+	if !httpRspUseStream {
+		w.stream.DestroyStream()
+	}
 	w.streamReceiver.OnReceive(ctx, headers, data, trailers)
 }
 
