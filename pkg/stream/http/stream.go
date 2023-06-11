@@ -306,6 +306,7 @@ func (conn *clientStreamConnection) serve() {
 				if reason == "" {
 					reason = types.StreamRemoteReset
 				}
+				s.connection.streamConnectionEventListener.OnGoAway()
 				s.ResetStream(reason)
 			}
 			return
@@ -343,7 +344,7 @@ func handleStreamResponse(conn *clientStreamConnection) {
 	}
 
 	sendStreamResponse := func(cs *clientStream) error {
-		return writeBodyToPipe(conn.br, 0, s.response.Header.ContentLength(), func(data []byte) error {
+		return writeBodyToPipe(conn.br, s.response.Header.ContentLength(), func(data []byte) error {
 			if _, err := cs.recData.Write(data); err != nil {
 				return err
 			}
@@ -363,6 +364,7 @@ func handleStreamResponse(conn *clientStreamConnection) {
 		if reason == "" {
 			reason = types.StreamRemoteReset
 		}
+		s.connection.streamConnectionEventListener.OnGoAway()
 		s.ResetStream(reason)
 		return
 	}
@@ -382,6 +384,7 @@ func handleBlockedResponse(conn *clientStreamConnection) {
 			if reason == "" {
 				reason = types.StreamRemoteReset
 			}
+			s.connection.streamConnectionEventListener.OnGoAway()
 			s.ResetStream(reason)
 		}
 		return
@@ -396,69 +399,59 @@ func handleBlockedResponse(conn *clientStreamConnection) {
 	}
 }
 
+const (
+	streamReadBufferSize = 1 << 10
+)
+
 // copy from fasthttp github.com/valyala/fasthttp@v1.40.0/http.go:1374
-func writeBodyToPipe(r *bufio.Reader, maxBodySize int, contentLength int, writeFunc func([]byte) error) (err error) {
-	buf := make([]byte, 0)
+func writeBodyToPipe(r *bufio.Reader, contentLength int, writeFunc func([]byte) error) (err error) {
 	if contentLength >= 0 {
-		err = writeFixedBody(r, contentLength, maxBodySize, buf, writeFunc)
+		err = writeFixedBody(r, contentLength, writeFunc)
 	} else if contentLength == -1 {
-		err = writeBodyChunked(r, maxBodySize, buf, writeFunc)
+		err = writeBodyChunked(r, writeFunc)
 	} else {
-		err = writeBodyIdentity(r, maxBodySize, buf, writeFunc)
+		err = writeBodyIdentity(r, writeFunc)
 	}
 	return err
 }
 
-var ErrBodyTooLarge = errors.New("body too large")
-
-func writeFixedBody(r *bufio.Reader, contentLength int, maxBodySize int, dst []byte, writeFunc func(data []byte) error) error {
-	if maxBodySize > 0 && contentLength > maxBodySize {
-		return ErrBodyTooLarge
-	}
-	_, err := writeBodyFixedSize(r, dst, contentLength, writeFunc)
+func writeFixedBody(r *bufio.Reader, contentLength int, writeFunc func(data []byte) error) error {
+	_, err := writeBodyFixedSize(r, contentLength, writeFunc)
 	return err
 }
 
-func writeBodyFixedSize(r *bufio.Reader, dst []byte, n int, writeFunc func(data []byte) error) ([]byte, error) {
-	if n == 0 {
-		return dst, nil
-	}
-
-	offset := len(dst)
-	dstLen := offset + n
-	if cap(dst) < dstLen {
-		b := make([]byte, round2(dstLen))
-		copy(b, dst)
-		dst = b
-	}
-	dst = dst[:dstLen]
-
+func writeBodyFixedSize(r *bufio.Reader, n int, writeFunc func(data []byte) error) ([]byte, error) {
+	bufp := buffer.GetBytes(streamReadBufferSize)
+	dst := *bufp
+	defer buffer.PutBytes(bufp)
+	remain := 0
 	for {
-		nn, err := r.Read(dst[offset:])
-		if nn <= 0 {
-			if err != nil {
-				if err == io.EOF {
-					err = io.ErrUnexpectedEOF
-				}
-				return dst[:offset], err
+		if remain > len(dst) {
+			buffer.PutBytes(bufp)
+			bufp = buffer.GetBytes(round2(len(dst)))
+			dst = *bufp
+		}
+		nn, err := r.Read(dst)
+		remain = n - nn - remain
+		if err == io.EOF {
+			if nn < n {
+				return dst[:nn], io.ErrUnexpectedEOF
 			}
-			panic(fmt.Sprintf("BUG: bufio.Read() returned (%d, nil)", nn))
+			return dst[:nn], nil
+		} else if err != nil {
+			return dst[:nn], err
 		}
-		if err = writeFunc((dst)[offset : offset+nn]); err != nil {
-			return dst, err
+		if err = writeFunc(dst[:nn]); err != nil {
+			return dst[:nn], err
 		}
-		offset += nn
-		if offset == dstLen {
-			return dst, nil
+		if nn == n {
+			return dst[:nn], nil
 		}
 	}
 }
 
-func writeBodyIdentity(r *bufio.Reader, maxBodySize int, dst []byte, writeFunc func(data []byte) error) error {
-	dst = dst[:cap(dst)]
-	if len(dst) == 0 {
-		dst = make([]byte, 1024)
-	}
+func writeBodyIdentity(r *bufio.Reader, writeFunc func(data []byte) error) error {
+	dst := make([]byte, streamReadBufferSize)
 	offset := 0
 	for {
 		nn, err := r.Read(dst[offset:])
@@ -469,10 +462,7 @@ func writeBodyIdentity(r *bufio.Reader, maxBodySize int, dst []byte, writeFunc f
 			return err
 		}
 		offset += nn
-		if maxBodySize > 0 && offset > maxBodySize {
-			return ErrBodyTooLarge
-		}
-		dst = expandBufferIfNeeded(dst, offset, maxBodySize)
+		dst = expandBufferIfNeeded(dst, offset)
 	}
 }
 
@@ -487,12 +477,9 @@ func handleError(err error, nn int) error {
 	return nil
 }
 
-func expandBufferIfNeeded(dst []byte, offset int, maxBodySize int) []byte {
+func expandBufferIfNeeded(dst []byte, offset int) []byte {
 	if len(dst) == offset {
 		n := round2(2 * offset)
-		if maxBodySize > 0 && n > maxBodySize {
-			n = maxBodySize + 1
-		}
 		b := make([]byte, n)
 		copy(b, dst)
 		dst = b
@@ -502,11 +489,7 @@ func expandBufferIfNeeded(dst []byte, offset int, maxBodySize int) []byte {
 
 var strCRLF = []byte("\r\n")
 
-func writeBodyChunked(r *bufio.Reader, maxBodySize int, dst []byte, writeFunc func(data []byte) error) error {
-	if len(dst) > 0 {
-		log.DefaultLogger.Fatalf("BUG: expected zero-length buffer")
-	}
-
+func writeBodyChunked(r *bufio.Reader, writeFunc func(data []byte) error) error {
 	for {
 		chunkSize, err := parseChunkSize(r)
 		if err != nil {
@@ -520,34 +503,30 @@ func writeBodyChunked(r *bufio.Reader, maxBodySize int, dst []byte, writeFunc fu
 			return nil
 		}
 
-		dst, err = handleChunk(r, maxBodySize, dst, chunkSize, writeFunc)
-		if err != nil {
+		if err = handleChunk(r, chunkSize, writeFunc); err != nil {
 			return err
 		}
 	}
 }
 
-func handleChunk(r *bufio.Reader, maxBodySize int, dst []byte, chunkSize int, writeFunc func(data []byte) error) ([]byte, error) {
-	if maxBodySize > 0 && len(dst)+chunkSize > maxBodySize {
-		return dst, ErrBodyTooLarge
-	}
+func handleChunk(r *bufio.Reader, chunkSize int, writeFunc func(data []byte) error) error {
 
 	chunkHeader := buildChunkHeader(chunkSize)
 	if err := writeFunc(chunkHeader); err != nil {
-		return dst, errors.New("cannot write chunk header: " + err.Error())
+		return errors.New("cannot write chunk header: " + err.Error())
 	}
 
 	strCRLFLen := len(strCRLF)
-	dst, err := writeBodyFixedSize(r, dst, chunkSize+strCRLFLen, writeFunc)
+	dst, err := writeBodyFixedSize(r, chunkSize+strCRLFLen, writeFunc)
 	if err != nil {
-		return dst, err
+		return err
 	}
 
 	if !bytes.Equal(dst[len(dst)-strCRLFLen:], strCRLF) {
-		return dst, errors.New("cannot find crlf at the end of chunk")
+		return errors.New("cannot find crlf at the end of chunk")
 	}
 
-	return dst[:len(dst)-strCRLFLen], nil
+	return nil
 }
 
 func buildChunkEnd() []byte {
