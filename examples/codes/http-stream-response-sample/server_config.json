@@ -53,6 +53,18 @@
 			]
 		}
 	],
+	"metrics": {
+		"flush_interval": "500ms",
+		"sinks": [
+			{
+				"type": "prometheus",
+				"config": {
+					"port": 39886,
+					"percentiles": [50, 90, 95, 96, 99]
+				}
+			}
+		]
+	},
 	"cluster_manager": {
 		"clusters": [
 			{

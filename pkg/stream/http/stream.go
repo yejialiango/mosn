@@ -339,7 +339,7 @@ func handleStreamResponse(conn *clientStreamConnection) {
 		s.connection.mutex.Lock()
 		s.connection.stream = nil
 		s.connection.mutex.Unlock()
-		cs.recData = buffer.NewPipeBuffer(0)
+		cs.recData = buffer.NewPipeBuffer(streamBufferSize)
 		cs.receiver.OnReceive(cs.ctx, mosnhttp.ResponseHeader{ResponseHeader: &s.response.Header}, cs.recData, nil)
 	}
 
@@ -400,7 +400,8 @@ func handleBlockedResponse(conn *clientStreamConnection) {
 }
 
 const (
-	streamReadBufferSize = 1 << 10
+	streamBufferSize        = 1 << 10 // default 1MB
+	maxStreamReadBufferSize = 1 << 23 // max     8MB
 )
 
 // copy from fasthttp github.com/valyala/fasthttp@v1.40.0/http.go:1374
@@ -421,12 +422,12 @@ func writeFixedBody(r *bufio.Reader, contentLength int, writeFunc func(data []by
 }
 
 func writeBodyFixedSize(r *bufio.Reader, n int, writeFunc func(data []byte) error) ([]byte, error) {
-	bufp := buffer.GetBytes(streamReadBufferSize)
+	bufp := buffer.GetBytes(streamBufferSize)
 	dst := *bufp
 	defer buffer.PutBytes(bufp)
 	remain := 0
 	for {
-		if remain > len(dst) {
+		if remain > len(dst) && len(dst) < maxStreamReadBufferSize {
 			buffer.PutBytes(bufp)
 			bufp = buffer.GetBytes(round2(len(dst)))
 			dst = *bufp
@@ -451,7 +452,7 @@ func writeBodyFixedSize(r *bufio.Reader, n int, writeFunc func(data []byte) erro
 }
 
 func writeBodyIdentity(r *bufio.Reader, writeFunc func(data []byte) error) error {
-	dst := make([]byte, streamReadBufferSize)
+	dst := make([]byte, streamBufferSize)
 	offset := 0
 	for {
 		nn, err := r.Read(dst[offset:])
